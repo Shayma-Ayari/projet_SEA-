@@ -6,7 +6,6 @@
 #include <pthread.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/msg.h>
 #include <semaphore.h>
 #include <fcntl.h>
 
@@ -23,16 +22,10 @@ typedef struct {
     sem_t *verrou;
 } TacheThread;
 
-/* Structure d'un message pour la file (le type long est obligatoire en premier) */
-struct message {
-    long type;
-    int numero_processus;
-    int images_traitees;
-};
-
 Image* lire_image(const char *chemin) {
     FILE *f = fopen(chemin, "r");
     if (!f) { perror("Erreur ouverture"); return NULL; }
+
     Image *img = malloc(sizeof(Image));
     char format[3];
     fscanf(f, "%s", format);
@@ -42,6 +35,7 @@ Image* lire_image(const char *chemin) {
     }
     fscanf(f, "%d %d", &img->largeur, &img->hauteur);
     fscanf(f, "%d", &img->max_val);
+
     int nb = img->largeur * img->hauteur * 3;
     img->pixels = malloc(nb * sizeof(unsigned char));
     for (int i = 0; i < nb; i++) {
@@ -52,37 +46,17 @@ Image* lire_image(const char *chemin) {
     return img;
 }
 
-void appliquer_flou(Image *img) {
-    int L = img->largeur;
-    int H = img->hauteur;
-    int nb = L * H * 3;
-    unsigned char *copie = malloc(nb);
-    for (int i = 0; i < nb; i++) copie[i] = img->pixels[i];
-
-    int rayon = 5;
-
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < L; x++) {
-            int somme_r = 0, somme_g = 0, somme_b = 0, compte = 0;
-            for (int dy = -rayon; dy <= rayon; dy++) {
-                for (int dx = -rayon; dx <= rayon; dx++) {
-                    int nx = x + dx, ny = y + dy;
-                    if (nx >= 0 && nx < L && ny >= 0 && ny < H) {
-                        int idx = (ny * L + nx) * 3;
-                        somme_r += copie[idx];
-                        somme_g += copie[idx + 1];
-                        somme_b += copie[idx + 2];
-                        compte++;
-                    }
-                }
-            }
-            int idx = (y * L + x) * 3;
-            img->pixels[idx]     = somme_r / compte;
-            img->pixels[idx + 1] = somme_g / compte;
-            img->pixels[idx + 2] = somme_b / compte;
-        }
+void convertir_gris(Image *img) {
+    int nb_pixels = img->largeur * img->hauteur;
+    for (int i = 0; i < nb_pixels; i++) {
+        unsigned char r = img->pixels[i*3];
+        unsigned char g = img->pixels[i*3+1];
+        unsigned char b = img->pixels[i*3+2];
+        unsigned char gris = (unsigned char)(0.299*r + 0.587*g + 0.114*b);
+        img->pixels[i*3] = gris;
+        img->pixels[i*3+1] = gris;
+        img->pixels[i*3+2] = gris;
     }
-    free(copie);
 }
 
 void sauvegarder_image(Image *img, const char *chemin) {
@@ -102,38 +76,19 @@ void liberer_image(Image *img) {
     free(img);
 }
 
-/* RECOUVREMENT : lance ImageMagick pour creer une vignette */
-void creer_vignette(const char *image_source, const char *vignette_sortie) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("convert", "convert",
-               image_source,
-               "-resize", "100x100",
-               vignette_sortie,
-               NULL);
-        perror("Echec exec convert");
-        exit(1);
-    } else if (pid > 0) {
-        wait(NULL);
-    }
-}
-
 void* tache_thread(void *arg) {
     TacheThread *tache = (TacheThread*)arg;
-    char entree[80], sortie[80];
+    char entree[50], sortie[50];
     sprintf(entree, "images/image%d.ppm", tache->numero_image);
     sprintf(sortie, "resultats/gris%d.ppm", tache->numero_image);
 
     Image *img = lire_image(entree);
     if (img) {
-        appliquer_flou(img);
+        convertir_gris(img);
         sauvegarder_image(img, sortie);
         liberer_image(img);
 
-        char vignette[80];
-        sprintf(vignette, "resultats/vignette%d.png", tache->numero_image);
-        creer_vignette(sortie, vignette);
-
+        /* Incrémenter le compteur global, PROTÉGÉ par le sémaphore */
         sem_wait(tache->verrou);
         (*tache->compteur_partage)++;
         sem_post(tache->verrou);
@@ -152,28 +107,26 @@ int main(int argc, char *argv[]) {
     printf("Configuration : %d processus, %d threads chacun\n",
            nb_processus, nb_threads);
 
-    /* Memoire partagee : compteur global */
+    /* Mémoire partagée pour le compteur */
     key_t cle = ftok(".", 'A');
     int shmid = shmget(cle, sizeof(int), IPC_CREAT | 0666);
     if (shmid == -1) { perror("Erreur shmget"); return 1; }
     int *compteur = (int*)shmat(shmid, NULL, 0);
     *compteur = 0;
 
-    /* Semaphore pour proteger le compteur */
-    sem_unlink("/sem_compteur");
+    /* Sémaphore NOMMÉ (fonctionne entre processus) */
+    sem_unlink("/sem_compteur");   /* nettoyer un éventuel ancien */
     sem_t *verrou = sem_open("/sem_compteur", O_CREAT, 0666, 1);
     if (verrou == SEM_FAILED) { perror("Erreur sem_open"); return 1; }
 
-    /* FILE DE MESSAGES : creation */
-    key_t cle_msg = ftok(".", 'B');
-    int msgid = msgget(cle_msg, IPC_CREAT | 0666);
-    if (msgid == -1) { perror("Erreur msgget"); return 1; }
-
     for (int p = 0; p < nb_processus; p++) {
         pid_t pid = fork();
+
         if (pid == 0) {
+            /* ===== ENFANT ===== */
             pthread_t threads[100];
             TacheThread taches[100];
+
             for (int t = 0; t < nb_threads; t++) {
                 taches[t].numero_image = p * nb_threads + t + 1;
                 taches[t].compteur_partage = compteur;
@@ -184,37 +137,21 @@ int main(int argc, char *argv[]) {
                 pthread_join(threads[t], NULL);
             }
 
-            /* L'enfant envoie un message au parent via la FILE DE MESSAGES */
-            struct message msg;
-            msg.type = 1;
-            msg.numero_processus = p + 1;
-            msg.images_traitees = nb_threads;
-            msgsnd(msgid, &msg, sizeof(msg) - sizeof(long), 0);
-
             shmdt(compteur);
             exit(0);
         }
     }
 
-    /* Le parent recoit les messages de chaque enfant via la FILE DE MESSAGES */
-    for (int p = 0; p < nb_processus; p++) {
-        struct message recu;
-        msgrcv(msgid, &recu, sizeof(recu) - sizeof(long), 1, 0);
-        printf("  [Queue] Processus %d a traite %d images\n",
-               recu.numero_processus, recu.images_traitees);
-    }
-
+    /* ===== PARENT ===== */
     for (int p = 0; p < nb_processus; p++) {
         wait(NULL);
     }
 
     printf("Parent : compteur global = %d images traitees\n", *compteur);
-    printf("Vignettes creees dans resultats/ (recouvrement via ImageMagick)\n");
 
     /* Nettoyage */
     shmdt(compteur);
     shmctl(shmid, IPC_RMID, NULL);
-    msgctl(msgid, IPC_RMID, NULL);
     sem_close(verrou);
     sem_unlink("/sem_compteur");
 

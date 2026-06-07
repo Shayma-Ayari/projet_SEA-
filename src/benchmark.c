@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <time.h>
 
+#define NB_IMAGES_TOTAL 40
+
 typedef struct {
     int largeur;
     int hauteur;
@@ -18,12 +20,13 @@ typedef struct {
 } Image;
 
 typedef struct {
-    int compteur;
+    int prochaine_image;
+    int total_images;
+    int images_traitees;
     double temps_calcul_total;
 } DonneesPartagees;
 
 typedef struct {
-    int numero_image;
     DonneesPartagees *donnees;
     sem_t *verrou;
 } TacheThread;
@@ -102,17 +105,27 @@ void liberer_image(Image *img) {
 
 void* tache_thread(void *arg) {
     TacheThread *tache = (TacheThread*)arg;
-    char entree[80], sortie[80];
-    sprintf(entree, "images/image%d.ppm", tache->numero_image);
-    sprintf(sortie, "resultats/gris%d.ppm", tache->numero_image);
 
-    Image *img = lire_image(entree);
-    if (img) {
+    while (1) {
+        sem_wait(tache->verrou);
+        int numero = tache->donnees->prochaine_image;
+        if (numero >= tache->donnees->total_images) {
+            sem_post(tache->verrou);
+            break;
+        }
+        tache->donnees->prochaine_image++;
+        sem_post(tache->verrou);
+
+        char entree[80], sortie[80];
+        sprintf(entree, "images/image%d.ppm", numero + 1);
+        sprintf(sortie, "resultats/gris%d.ppm", numero + 1);
+
+        Image *img = lire_image(entree);
+        if (!img) continue;
+
         struct timespec t1, t2;
         clock_gettime(CLOCK_MONOTONIC, &t1);
-
         appliquer_flou(img);
-
         clock_gettime(CLOCK_MONOTONIC, &t2);
         double duree = (t2.tv_sec - t1.tv_sec) + (t2.tv_nsec - t1.tv_nsec) / 1e9;
 
@@ -120,7 +133,7 @@ void* tache_thread(void *arg) {
         liberer_image(img);
 
         sem_wait(tache->verrou);
-        tache->donnees->compteur++;
+        tache->donnees->images_traitees++;
         tache->donnees->temps_calcul_total += duree;
         sem_post(tache->verrou);
     }
@@ -129,20 +142,23 @@ void* tache_thread(void *arg) {
 
 int main(int argc, char *argv[]) {
     int nb_processus = 2;
-    int nb_threads = 3;
+    int nb_threads = 1;
     if (argc == 3) {
         nb_processus = atoi(argv[1]);
         nb_threads = atoi(argv[2]);
     }
 
-    printf("Configuration : %d processus, %d threads chacun\n",
-           nb_processus, nb_threads);
+    int nb_workers = nb_processus * nb_threads;
+    printf("Configuration : %d processus x %d threads = %d workers, %d images au total\n",
+           nb_processus, nb_threads, nb_workers, NB_IMAGES_TOTAL);
 
     key_t cle = ftok(".", 'A');
     int shmid = shmget(cle, sizeof(DonneesPartagees), IPC_CREAT | 0666);
     if (shmid == -1) { perror("Erreur shmget"); return 1; }
     DonneesPartagees *donnees = (DonneesPartagees*)shmat(shmid, NULL, 0);
-    donnees->compteur = 0;
+    donnees->prochaine_image = 0;
+    donnees->total_images = NB_IMAGES_TOTAL;
+    donnees->images_traitees = 0;
     donnees->temps_calcul_total = 0.0;
 
     sem_unlink("/sem_compteur");
@@ -158,7 +174,6 @@ int main(int argc, char *argv[]) {
             pthread_t threads[100];
             TacheThread taches[100];
             for (int t = 0; t < nb_threads; t++) {
-                taches[t].numero_image = p * nb_threads + t + 1;
                 taches[t].donnees = donnees;
                 taches[t].verrou = verrou;
                 pthread_create(&threads[t], NULL, tache_thread, &taches[t]);
@@ -178,7 +193,7 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &fin);
     double temps_mur = (fin.tv_sec - debut.tv_sec) + (fin.tv_nsec - debut.tv_nsec) / 1e9;
 
-    int n = donnees->compteur;
+    int n = donnees->images_traitees;
     double calcul_par_image = (n > 0) ? donnees->temps_calcul_total / n : 0;
 
     printf("Images traitees      : %d\n", n);
