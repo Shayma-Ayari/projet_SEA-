@@ -1,0 +1,15 @@
+# Fichiers compilés (exécutables)
+*.o
+traitement_complet
+benchmark
+philosophes
+barbier
+generer_image
+app_finale
+test_*
+
+# Images générées (trop lourdes)
+*.ppm
+images/
+resultats/
+grande.ppm
